@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: sitetool_app
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./cloned_sites:/app/cloned_sites
+      - ./tool_sessions:/app/tool_sessions
+      - ./cookie_jars:/app/cookie_jars
+      - ./exports:/app/exports
+      - ./queue:/app/queue.sqlite
+      - ./logs:/app
+    environment:
+      - APP_ENV=production
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTP_AUTH=${HTTP_AUTH:-}
+    restart: unless-stopped
+
+  worker:
+    build: .
+    container_name: sitetool_worker
+    command: php graber.php worker
+    volumes:
+      - ./cloned_sites:/app/cloned_sites
+      - ./tool_sessions:/app/tool_sessions
+      - ./cookie_jars:/app/cookie_jars
+      - ./exports:/app/exports
+      - ./queue:/app/queue.sqlite
+      - ./logs:/app
+    environment:
+      - APP_ENV=production
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTP_AUTH=${HTTP_AUTH:-}
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  cloned_sites:
+  tool_sessions:
+  cookie_jars:
+  exports:
+  queue:
+  logs:

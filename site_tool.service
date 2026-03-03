@@ -1,0 +1,28 @@
+[Unit]
+Description=Site Tool Worker Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/sitetool
+ExecStart=/usr/bin/php /var/www/sitetool/graber.php worker
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/www/sitetool/cloned_sites
+ReadWritePaths=/var/www/sitetool/tool_sessions
+ReadWritePaths=/var/www/sitetool/cookie_jars
+ReadWritePaths=/var/www/sitetool/exports
+ReadWritePaths=/var/www/sitetool/queue.sqlite
+
+[Install]
+WantedBy=multi-user.target
