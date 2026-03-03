@@ -1,0 +1,279 @@
+<?php
+
+declare(strict_types=1);
+
+namespace SiteTool\Queue;
+
+use SiteTool\Core\Config;
+
+final class QueueSqlite
+{
+    private \SQLite3 $db;
+    private string $queueName;
+
+    public function __construct(string $dbPath = null, string $queueName = 'default')
+    {
+        $dbPath = $dbPath ?? Config::QUEUE_DB;
+        $this->queueName = $queueName;
+
+        $dir = dirname($dbPath);
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
+        $this->db = new \SQLite3($dbPath);
+        $this->db->busyTimeout(5000);
+        $this->db->exec('PRAGMA journal_mode = WAL');
+        $this->db->exec('PRAGMA synchronous = NORMAL');
+
+        $this->initTable();
+    }
+
+    private function initTable(): void
+    {
+        $this->db->exec(<<<SQL
+            CREATE TABLE IF NOT EXISTS {$this->queueName} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                attempts INTEGER DEFAULT 0,
+                max_attempts INTEGER DEFAULT 3,
+                status TEXT DEFAULT 'pending',
+                error TEXT,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                scheduled_at INTEGER DEFAULT (strftime('%s', 'now')),
+                started_at INTEGER,
+                completed_at INTEGER
+            )
+        SQL);
+
+        $this->db->exec(<<<SQL
+            CREATE INDEX IF NOT EXISTS idx_{$this->queueName}_status 
+            ON {$this->queueName}(status, scheduled_at)
+        SQL);
+
+        $this->db->exec(<<<SQL
+            CREATE INDEX IF NOT EXISTS idx_{$this->queueName}_priority 
+            ON {$this->queueName}(priority DESC, scheduled_at)
+        SQL);
+    }
+
+    public function push(string $payload, int $priority = 0, int $delay = 0, int $maxAttempts = 3): int
+    {
+        $scheduledAt = time() + $delay;
+
+        $stmt = $this->db->prepare(<<<SQL
+            INSERT INTO {$this->queueName} (payload, priority, max_attempts, scheduled_at)
+            VALUES (:payload, :priority, :max_attempts, :scheduled_at)
+        SQL);
+
+        $stmt->bindValue(':payload', $payload, SQLITE3_TEXT);
+        $stmt->bindValue(':priority', $priority, SQLITE3_INTEGER);
+        $stmt->bindValue(':max_attempts', $maxAttempts, SQLITE3_INTEGER);
+        $stmt->bindValue(':scheduled_at', $scheduledAt, SQLITE3_INTEGER);
+
+        $stmt->execute();
+        $id = $this->db->lastInsertRowID();
+        $stmt->close();
+
+        return $id;
+    }
+
+    public function pop(int $timeout = 30): ?array
+    {
+        $startTime = time();
+        
+        while (true) {
+            $this->db->exec('BEGIN IMMEDIATE TRANSACTION');
+
+            $stmt = $this->db->prepare(<<<SQL
+                SELECT id, payload, priority, attempts, max_attempts
+                FROM {$this->queueName}
+                WHERE status = 'pending' 
+                  AND scheduled_at <= :now
+                ORDER BY priority DESC, scheduled_at ASC
+                LIMIT 1
+            SQL);
+
+            $stmt->bindValue(':now', time(), SQLITE3_INTEGER);
+            $result = $stmt->execute();
+            $row = $result->fetchArray(SQLITE3_ASSOC);
+            $stmt->close();
+
+            if ($row) {
+                $updateStmt = $this->db->prepare(<<<SQL
+                    UPDATE {$this->queueName}
+                    SET status = 'processing',
+                        attempts = attempts + 1,
+                        started_at = :now
+                    WHERE id = :id
+                SQL);
+
+                $updateStmt->bindValue(':now', time(), SQLITE3_INTEGER);
+                $updateStmt->bindValue(':id', $row['id'], SQLITE3_INTEGER);
+                $updateStmt->execute();
+                $updateStmt->close();
+
+                $this->db->exec('COMMIT');
+
+                return [
+                    'id' => $row['id'],
+                    'payload' => $row['payload'],
+                    'priority' => $row['priority'],
+                    'attempts' => $row['attempts'] + 1,
+                    'max_attempts' => $row['max_attempts'],
+                ];
+            }
+
+            $this->db->exec('ROLLBACK');
+
+            if ((time() - $startTime) >= $timeout) {
+                return null;
+            }
+
+            usleep(100000); // 100ms
+        }
+    }
+
+    public function complete(int $id): void
+    {
+        $stmt = $this->db->prepare(<<<SQL
+            UPDATE {$this->queueName}
+            SET status = 'completed',
+                completed_at = :now
+            WHERE id = :id
+        SQL);
+
+        $stmt->bindValue(':now', time(), SQLITE3_INTEGER);
+        $stmt->bindValue(':id', $id, SQLITE3_INTEGER);
+        $stmt->execute();
+        $stmt->close();
+    }
+
+    public function fail(int $id, string $error): void
+    {
+        $stmt = $this->db->prepare(<<<SQL
+            UPDATE {$this->queueName}
+            SET status = 'failed',
+                error = :error,
+                completed_at = :now
+            WHERE id = :id
+        SQL);
+
+        $stmt->bindValue(':error', $error, SQLITE3_TEXT);
+        $stmt->bindValue(':now', time(), SQLITE3_INTEGER);
+        $stmt->bindValue(':id', $id, SQLITE3_INTEGER);
+        $stmt->execute();
+        $stmt->close();
+    }
+
+    public function release(int $id, int $delay = 60): void
+    {
+        $scheduledAt = time() + $delay;
+
+        $stmt = $this->db->prepare(<<<SQL
+            UPDATE {$this->queueName}
+            SET status = 'pending',
+                scheduled_at = :scheduled_at
+            WHERE id = :id
+        SQL);
+
+        $stmt->bindValue(':scheduled_at', $scheduledAt, SQLITE3_INTEGER);
+        $stmt->bindValue(':id', $id, SQLITE3_INTEGER);
+        $stmt->execute();
+        $stmt->close();
+    }
+
+    public function getStats(): array
+    {
+        $stats = [
+            'pending' => 0,
+            'processing' => 0,
+            'completed' => 0,
+            'failed' => 0,
+            'total' => 0,
+        ];
+
+        $result = $this->db->query(<<<SQL
+            SELECT status, COUNT(*) as count
+            FROM {$this->queueName}
+            GROUP BY status
+        SQL);
+
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $stats[$row['status']] = $row['count'];
+            $stats['total'] += $row['count'];
+        }
+
+        return $stats;
+    }
+
+    public function clear(): void
+    {
+        $this->db->exec("DELETE FROM {$this->queueName}");
+    }
+
+    public function clearCompleted(int $olderThan = 3600): void
+    {
+        $cutoff = time() - $olderThan;
+
+        $stmt = $this->db->prepare(<<<SQL
+            DELETE FROM {$this->queueName}
+            WHERE status IN ('completed', 'failed')
+              AND completed_at < :cutoff
+        SQL);
+
+        $stmt->bindValue(':cutoff', $cutoff, SQLITE3_INTEGER);
+        $stmt->execute();
+        $stmt->close();
+    }
+
+    public function getJob(int $id): ?array
+    {
+        $stmt = $this->db->prepare(<<<SQL
+            SELECT * FROM {$this->queueName}
+            WHERE id = :id
+        SQL);
+
+        $stmt->bindValue(':id', $id, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $row = $result->fetchArray(SQLITE3_ASSOC);
+        $stmt->close();
+
+        return $row ?: null;
+    }
+
+    public function getJobs(int $limit = 100, int $offset = 0): array
+    {
+        $jobs = [];
+
+        $stmt = $this->db->prepare(<<<SQL
+            SELECT * FROM {$this->queueName}
+            ORDER BY id DESC
+            LIMIT :limit OFFSET :offset
+        SQL);
+
+        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(':offset', $offset, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $jobs[] = $row;
+        }
+
+        $stmt->close();
+        return $jobs;
+    }
+
+    public function close(): void
+    {
+        $this->db->close();
+    }
+
+    public function __destruct()
+    {
+        if (isset($this->db)) {
+            $this->db->close();
+        }
+    }
+}
